@@ -53,7 +53,7 @@ type si struct {
 	c []byte
 }
 
-func (s si) Next() (multihash.Multihash, error) {
+func (s *si) Next() (multihash.Multihash, error) {
 	if s.c == nil {
 		return nil, io.EOF
 	}
@@ -151,7 +151,7 @@ func serverCommand(cctx *cli.Context) error {
 	}
 
 	simpleLister := func(ctx context.Context, provider peer.ID, contextID []byte) (provider.MultihashIterator, error) {
-		return si{contextID}, nil
+		return &si{contextID}, nil
 	}
 	eng.RegisterMultihashLister(simpleLister)
 
