@@ -4,23 +4,24 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"time"
 
-	datatransfer "github.com/filecoin-project/go-data-transfer/v2/impl"
-	dtnetwork "github.com/filecoin-project/go-data-transfer/v2/network"
-	gstransport "github.com/filecoin-project/go-data-transfer/v2/transport/graphsync"
+	"github.com/ipfs/go-cid"
 	leveldb "github.com/ipfs/go-ds-leveldb"
-	gsimpl "github.com/ipfs/go-graphsync/impl"
-	gsnet "github.com/ipfs/go-graphsync/network"
+	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	logging "github.com/ipfs/go-log/v2"
 	"github.com/ipfs/kubo/core/bootstrap"
-	cidlink "github.com/ipld/go-ipld-prime/linking/cid"
+	provider "github.com/ipni/index-provider"
 	"github.com/ipni/index-provider/engine"
 	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/mitchellh/go-homedir"
 	"github.com/multiformats/go-multiaddr"
+	"github.com/multiformats/go-multihash"
 	"github.com/urfave/cli/v2"
+	bitswapserver "github.com/willscott/go-selfish-bitswap-client/server"
 
 	"github.com/willscott/ipni-minimal-publisher/config"
 )
@@ -46,6 +47,22 @@ var serverFlags = []cli.Flag{
 		Value:    "info",
 		Required: false,
 	},
+}
+
+type si struct {
+	c []byte
+}
+
+func (s si) Next() (multihash.Multihash, error) {
+	if s.c == nil {
+		return nil, io.EOF
+	}
+	_, c, err := cid.CidFromBytes(s.c)
+	if err != nil {
+		return nil, err
+	}
+	s.c = nil
+	return c.Hash(), nil
 }
 
 func serverCommand(cctx *cli.Context) error {
@@ -103,28 +120,18 @@ func serverCommand(cctx *cli.Context) error {
 		return err
 	}
 
-	gsnet := gsnet.NewFromLibp2pHost(h)
-	dtNet := dtnetwork.NewFromLibp2pHost(h)
-	gs := gsimpl.New(context.Background(), gsnet, cidlink.DefaultLinkSystem())
-	tp := gstransport.NewTransport(h.ID(), gs)
-	dt, err := datatransfer.NewDataTransfer(ds, dtNet, tp)
-	if err != nil {
-		return err
-	}
-	err = dt.Start(context.Background())
-	if err != nil {
-		return err
-	}
-
 	httpListenAddr, err := cfg.Ingest.ListenNetAddr()
 	if err != nil {
 		return err
 	}
 
+	// start bitswap.
+	bs := blockstore.NewBlockstore(ds)
+	bitswapserver.AttachBitswapServer(h, bs)
+
 	// Starting provider core
 	eng, err := engine.New(
 		engine.WithDatastore(ds),
-		engine.WithDataTransfer(dt),
 		engine.WithDirectAnnounce(cfg.DirectAnnounce.URLs...),
 		engine.WithHost(h),
 		engine.WithEntriesCacheCapacity(cfg.Ingest.LinkCacheSize),
@@ -142,6 +149,15 @@ func serverCommand(cctx *cli.Context) error {
 	if err != nil {
 		return err
 	}
+
+	simpleLister := func(ctx context.Context, provider peer.ID, contextID []byte) (provider.MultihashIterator, error) {
+		return si{contextID}, nil
+	}
+	eng.RegisterMultihashLister(simpleLister)
+
+	// start admin http
+	cs := NewControlServer(bs, eng, cfg.ProviderServer.ControlAddr)
+	go cs.Start()
 
 	droutingErrChan := make(chan error, 1)
 	// If there are bootstrap peers and bootstrapping is enabled, then try to
@@ -196,6 +212,7 @@ func serverCommand(cctx *cli.Context) error {
 
 	// cancel libp2p server
 	cancelp2p()
+	cs.Shutdown(shutdownCtx)
 	return finalErr
 }
 
